@@ -1,0 +1,18 @@
+[[source]]
+url = "https://pypi.org/simple"
+verify_ssl = true
+name = "pypi"
+
+[packages]
+prefect = "==3.9.0"
+httpx = "==0.28.1"
+duckdb = "==2.0.0"
+dbt-core = "==1.12.6"
+dbt-duckdb = "==1.11.0"
+prefect-dbt = "==0.7.25"
+
+[dev-packages]
+
+[requires]
+python_version = "3.12"
+python_full_version = "3.12.2"

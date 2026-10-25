@@ -2,3 +2,11 @@ storage*
 github*
 CLAUDE.md
 *.duckdb
+*.duckdb.wal
+data/
+logs/
+*.log
+target/
+dbt_packages/
+__pycache__/
+.venv/
