@@ -7,7 +7,7 @@ from pipeline.github import get_client
 from pipeline.logs import TeeLogger
 
 
-@flow(name="package-health", log_prints=True)
+@flow(name="vra7dy-package-health-flow", log_prints=True)
 def package_health_flow() -> dict:
     extracted = extract()
     # Tasks 2-6 (load, dbt build, validate, model, plot) are added here next.
