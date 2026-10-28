@@ -7,6 +7,7 @@ from pipeline.github import get_client
 from pipeline.load import load
 from pipeline.logs import TeeLogger
 from pipeline.transform import dbt_build
+from pipeline.validate import validate
 
 
 @flow(name="vra7dy-package-health-flow", log_prints=True)
@@ -14,7 +15,8 @@ def package_health_flow() -> dict:
     extracted = extract()
     load()
     dbt_build()
-    # Tasks 4-6 (validate, model, plot) are added here next.
+    validate()
+    # Tasks 5-6 (model, plot) are added here next.
 
     TeeLogger("flow").info(f"API odometer: {get_client().requests} requests this flow run")
     return extracted
