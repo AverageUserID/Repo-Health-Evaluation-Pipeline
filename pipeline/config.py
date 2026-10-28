@@ -8,6 +8,7 @@ RAW_DIR = PROJECT_DIR / "data" / "raw"
 LOADED_MARKER = RAW_DIR / "_LOADED"
 DB_PATH = PROJECT_DIR / "packages.duckdb"
 LOG_DIR = PROJECT_DIR / "logs"
+PLOT_DIR = PROJECT_DIR / "plots"
 
 API_URL = "https://api.github.com"
 PER_PAGE = 100
