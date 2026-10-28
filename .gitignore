@@ -10,3 +10,4 @@ target/
 dbt_packages/
 __pycache__/
 .venv/
+.user.yml

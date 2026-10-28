@@ -1,0 +1,234 @@
+version: 2
+
+models:
+  - name: fct_pull_requests
+    description: >
+      One row per PR created on or after the window start, with precalculated flags and
+      durations (hours). PRs still open at run time are kept with is_open = true and NULL
+      merge/close durations; they never get a fake close date. Medians over these
+      durations therefore describe finished PRs only; pct_reviewed_within_7d and
+      pct_open_stale in mart_health_inputs count the PRs still waiting.
+    columns:
+      - name: repo
+        description: Repository as `owner/name`.
+        data_tests: [not_null]
+      - name: number
+        description: PR number within the repo.
+        data_tests: [not_null]
+      - name: pr_key
+        description: "`repo#number`, the primary key."
+        data_tests: [unique, not_null]
+      - name: author_login
+        description: GitHub login of the PR author.
+      - name: is_bot
+        description: True if the PR author is a bot (bot rule in macros/is_bot.sql).
+        data_tests: [not_null]
+      - name: state
+        description: "`open` or `closed` at run time."
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['open', 'closed']
+      - name: created_at
+        description: When the PR was opened (UTC).
+        data_tests: [not_null]
+      - name: updated_at
+        description: Last activity on the PR (UTC).
+        data_tests: [not_null]
+      - name: closed_at
+        description: When the PR was closed, merged or not (UTC); NULL while open.
+      - name: merged_at
+        description: When the PR was merged (UTC); NULL unless merged.
+      - name: is_merged
+        description: merged_at IS NOT NULL.
+        data_tests: [not_null]
+      - name: is_closed_unmerged
+        description: state = 'closed' AND merged_at IS NULL.
+        data_tests: [not_null]
+      - name: is_open
+        description: state = 'open' (open at run time).
+        data_tests: [not_null]
+      - name: first_review_at
+        description: >
+          Earliest submitted review by someone other than the PR author and not a bot;
+          NULL if never reviewed.
+      - name: hours_to_first_review
+        description: Hours from created_at to first_review_at; NULL if never reviewed.
+        data_tests: [non_negative]
+      - name: hours_to_merge
+        description: Hours from created_at to merged_at; NULL unless merged.
+        data_tests: [non_negative]
+      - name: hours_to_close
+        description: Hours from created_at to closed_at, merged or not; NULL while open.
+        data_tests: [non_negative]
+      - name: has_approving_review
+        description: Any non-author, non-bot review with state APPROVED.
+        data_tests: [not_null]
+      - name: reviewed_within_7d
+        description: hours_to_first_review <= 168; false if never reviewed.
+        data_tests: [not_null]
+      - name: is_stale
+        description: Open and no activity (updated_at) in the 180 days before run time.
+        data_tests: [not_null]
+
+  - name: fct_releases
+    description: >
+      One row per published release on or after the window start. days_since_previous
+      is computed over all releases before filtering to the window.
+    columns:
+      - name: repo
+        description: Repository as `owner/name`.
+        data_tests: [not_null]
+      - name: release_id
+        description: Release id, the primary key.
+        data_tests: [unique, not_null]
+      - name: tag_name
+        description: Git tag of the release.
+      - name: published_at
+        description: When the release was published (UTC).
+        data_tests: [not_null]
+      - name: is_prerelease
+        description: True for pre-releases.
+        data_tests: [not_null]
+      - name: days_since_previous
+        description: Whole days since the repo's previous published release; NULL for its first-ever release.
+        data_tests: [non_negative]
+
+  - name: mart_repo_monthly
+    description: >
+      Repo x month from the window's first month through the run month; months with no
+      activity show 0. PR measures exclude bot-authored PRs, and each event is counted
+      in the month it happened (opened by created_at, merged by merged_at, closed by
+      closed_at). Months are UTC.
+    data_tests:
+      - unique_together:
+          arguments:
+            columns: [repo, month]
+    columns:
+      - name: repo
+        description: Repository as `owner/name`.
+        data_tests: [not_null]
+      - name: month
+        description: First instant of the month (UTC).
+        data_tests: [not_null]
+      - name: month_index
+        description: Months since the window's first month (0, 1, 2, ...); the x-axis for trend slopes.
+        data_tests: [not_null, non_negative]
+      - name: prs_opened
+        description: Human PRs created this month.
+        data_tests: [not_null, non_negative]
+      - name: prs_merged
+        description: Human PRs merged this month.
+        data_tests: [not_null, non_negative]
+      - name: prs_closed_unmerged
+        description: Human PRs closed without merging this month.
+        data_tests: [not_null, non_negative]
+      - name: merge_ratio
+        description: prs_merged / (prs_merged + prs_closed_unmerged); NULL when no PR was closed this month.
+        data_tests:
+          - between:
+              arguments: {min_value: 0, max_value: 1}
+      - name: median_first_review_hours
+        description: Median hours_to_first_review of human PRs opened this month (unreviewed PRs drop out).
+        data_tests: [non_negative]
+      - name: median_merge_hours
+        description: Median hours_to_merge of human PRs merged this month.
+        data_tests: [non_negative]
+      - name: commits
+        description: Commits by committed_at (author date) this month, bots included.
+        data_tests: [not_null, non_negative]
+      - name: active_contributors
+        description: Distinct non-bot authors who opened a PR this month.
+        data_tests: [not_null, non_negative]
+      - name: is_partial_month
+        description: True for the run month, which is still in progress.
+        data_tests: [not_null]
+      - name: open_backlog_end
+        description: >
+          Human PRs created in the window and still open at the end of the month
+          (running total of opened minus merged minus closed unmerged).
+        data_tests: [not_null, non_negative]
+
+  - name: mart_health_inputs
+    description: >
+      One row per repo with every candidate health metric for Task 5. Every column is a
+      rate, share, median, or size-relative slope, never a raw count. PR metrics exclude
+      bot-authored PRs; trends use complete months only. Direction (which way is
+      healthier) is given in each description.
+    columns:
+      - name: repo
+        description: Repository as `owner/name`.
+        data_tests: [unique, not_null]
+      - name: commits_per_week
+        description: "Activity. Commits in the window / (days in window / 7). Higher is healthier."
+        data_tests: [non_negative]
+      - name: commit_trend_pct
+        description: >
+          Activity, trend. regr_slope(commits, month_index) over complete months divided by
+          the repo's average monthly commits: % change per month. Higher is healthier.
+      - name: median_hours_to_first_review
+        description: >
+          Responsiveness. Median hours from PR creation to first non-author, non-bot review,
+          over reviewed PRs. Lower is healthier.
+        data_tests: [non_negative]
+      - name: pct_reviewed_within_7d
+        description: >
+          Responsiveness. Share of PRs created at least 7 days before run time that were
+          reviewed within 7 days (never-reviewed counts as no). Higher is healthier.
+        data_tests:
+          - between:
+              arguments: {min_value: 0, max_value: 1}
+      - name: pct_merged_with_approval
+        description: "Responsiveness. Share of merged PRs with an approving review. Higher is healthier."
+        data_tests:
+          - between:
+              arguments: {min_value: 0, max_value: 1}
+      - name: merge_rate
+        description: "Throughput. Merged / (merged + closed unmerged) over closed PRs. Higher is healthier."
+        data_tests:
+          - between:
+              arguments: {min_value: 0, max_value: 1}
+      - name: merged_per_opened
+        description: "Throughput. Share of PRs opened in the window that were merged. Higher is healthier."
+        data_tests:
+          - between:
+              arguments: {min_value: 0, max_value: 1}
+      - name: median_hours_to_merge
+        description: "Throughput. Median hours from creation to merge, over merged PRs. Lower is healthier."
+        data_tests: [non_negative]
+      - name: pct_open_stale
+        description: "Backlog. Share of open PRs with no activity in 180+ days. Lower is healthier."
+        data_tests:
+          - between:
+              arguments: {min_value: 0, max_value: 1}
+      - name: open_backlog_growth_pct
+        description: >
+          Backlog, trend. regr_slope(open_backlog_end, month_index) over complete months
+          divided by average monthly PRs opened: how fast unresolved PRs pile up relative
+          to incoming PRs. Lower is healthier.
+      - name: releases_per_year
+        description: "Release cadence. Published releases in the window / (days in window / 365.25). Higher is healthier."
+        data_tests: [non_negative]
+      - name: release_interval_cv
+        description: >
+          Release cadence. Coefficient of variation (stddev / mean) of days between
+          releases; regularity. Lower is healthier.
+        data_tests: [non_negative]
+      - name: active_authors_per_month
+        description: "Contributor base. Median monthly distinct non-bot PR authors, complete months. Higher is healthier."
+        data_tests: [non_negative]
+      - name: top_author_share
+        description: "Contributor base. Share of merged PRs by the single most prolific author. Lower is healthier."
+        data_tests:
+          - between:
+              arguments: {min_value: 0, max_value: 1}
+      - name: bus_factor
+        description: >
+          Contributor base. Fewest authors who together account for at least 50% of merged
+          PRs (a small threshold count of people, not a volume). Higher is healthier.
+        data_tests: [non_negative]
+      - name: author_trend_pct
+        description: >
+          Contributor base, trend. regr_slope(active_contributors, month_index) over
+          complete months divided by their average: % change per month. Higher is healthier.

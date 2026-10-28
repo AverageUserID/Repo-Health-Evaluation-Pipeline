@@ -12,16 +12,20 @@ clean-targets:         # directories to be removed by `dbt clean`
   - "target"
   - "dbt_packages"
 
-# Configuring models
-# Full documentation: https://docs.getdbt.com/docs/configuring-models
-
-# In this example config, we tell dbt to build all models in the example/
-# directory as views. These settings can be overridden in the individual model
-# files using the `{{ config(...) }}` macro.
-
-# include additional dirs as needed below, not just "example"
 models:
   package_health:
-    # Config indicated by + and applies to all files under models/example/
-    example:
+    # Staging is a thin typed view over raw: no stored copy, always matches raw.
+    staging:
       +materialized: view
+    # Facts and marts are computed once per build (JSON parsing, medians) and read
+    # repeatedly by Tasks 4-6. dbt rebuilds them with create-or-replace every build.
+    marts:
+      +materialized: table
+
+vars:
+  # Start of the analysis window. The flow passes the same value Task 1 used
+  # (PIPELINE_START) so dev runs on a shorter window stay consistent.
+  window_start: '2024-01-01T00:00:00Z'
+  # Repos to analyze. The flow passes the same list Task 1 fetched (PIPELINE_REPOS),
+  # so a repo with missing data shows up as zeros instead of disappearing.
+  repos: ['scikit-learn/scikit-learn', 'dask/dask', 'plotly/plotly.py']

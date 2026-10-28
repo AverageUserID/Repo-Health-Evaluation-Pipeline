@@ -1,0 +1,39 @@
+version: 2
+
+sources:
+  - name: raw
+    schema: main
+    description: >
+      Raw GitHub records loaded by Task 2 (pipeline/load.py). One row per record,
+      upserted on (repo, id); the full record as returned by GitHub is in `payload`.
+    tables:
+      - name: raw_commits
+        description: Commits on the default branch since the window start. `id` is the commit sha.
+        columns: &raw_columns
+          - name: repo
+            description: Repository as `owner/name`.
+          - name: id
+            description: Natural key (commit sha; PR number; review or release id).
+          - name: updated_at
+            description: >
+              The record's last-changed time: commit committer date, PR updated_at,
+              review submitted_at, release updated_at.
+          - name: fetched_at
+            description: When the landing page holding this record was fetched (UTC).
+          - name: source_file
+            description: Path of the landing file the row came from.
+          - name: payload
+            description: The complete record as JSON.
+      - name: raw_pull_requests
+        description: Pull requests updated since the window start. `id` is the PR number.
+        columns: *raw_columns
+      - name: raw_pr_reviews
+        description: Reviews on PRs created in the window. `id` is the review id.
+        columns: *raw_columns
+      - name: raw_releases
+        description: All releases, including drafts and pre-releases. `id` is the release id.
+        columns: *raw_columns
+      - name: _load_state
+        description: >
+          Load bookkeeping, one row per (repo, endpoint): the watermark Task 1 reads
+          for incremental runs, row counts, and load time.

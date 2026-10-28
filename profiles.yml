@@ -2,6 +2,10 @@ package_health:
   outputs:
     dev:
       type: duckdb
-      path: packages.duckdb
+      # The flow sets DUCKDB_PATH to the absolute path; by hand, run dbt from the repo root.
+      path: "{{ env_var('DUCKDB_PATH', 'packages.duckdb') }}"
       threads: 1
+      settings:
+        # GitHub timestamps are UTC; bucket months in UTC, not the laptop's time zone.
+        TimeZone: UTC
   target: dev

@@ -1,0 +1,189 @@
+version: 2
+
+models:
+  - name: repos
+    description: >
+      The repos under analysis, from the `repos` dbt var (the same list Task 1 fetched).
+      Spines are built from this list, not from the data, so missing data shows as zeros.
+    columns:
+      - name: repo
+        description: Repository as `owner/name`.
+        data_tests:
+          - unique
+          - not_null
+
+  - name: stg_commits
+    description: >
+      One row per commit on the default branch, deduplicated to the latest fetch per
+      (repo, sha). Bot rule (macros/is_bot.sql): the author is a bot if author.type is
+      'Bot' or author.login ends in '[bot]'; a commit with no linked account is not a bot.
+    data_tests:
+      - unique_together:
+          arguments:
+            columns: [repo, sha]
+    columns:
+      - name: repo
+        description: Repository as `owner/name`.
+        data_tests:
+          - not_null
+      - name: sha
+        description: Commit sha (natural key).
+        data_tests:
+          - not_null
+      - name: author_login
+        description: GitHub login of the commit author; NULL when the commit email isn't linked to an account.
+      - name: is_bot
+        description: True if the commit author is a bot (see the bot rule above).
+        data_tests:
+          - not_null
+      - name: committed_at
+        description: >
+          commit.author.date (UTC), when the change was written; used to bucket commits by
+          month. A commit written before the window start but merged after it is loaded
+          (Task 1 filters on the committer date) but falls outside the monthly marts.
+        data_tests:
+          - not_null
+      - name: committer_at
+        description: commit.committer.date (UTC), when the commit landed on the branch.
+        data_tests:
+          - not_null
+      - name: fetched_at
+        description: When the landing page holding this commit was fetched (UTC).
+
+  - name: stg_pull_requests
+    description: >
+      One row per pull request, deduplicated to the latest fetch per (repo, number).
+      is_bot uses the bot rule (macros/is_bot.sql) on the PR author.
+    columns:
+      - name: repo
+        description: Repository as `owner/name`.
+        data_tests:
+          - not_null
+      - name: number
+        description: PR number (natural key within a repo).
+        data_tests:
+          - not_null
+      - name: pr_key
+        description: "`repo#number`, unique across repos; reviews reference PRs by it."
+        data_tests:
+          - unique
+          - not_null
+      - name: author_login
+        description: GitHub login of the PR author.
+      - name: is_bot
+        description: True if the PR author is a bot.
+        data_tests:
+          - not_null
+      - name: state
+        description: "`open` or `closed` (merged PRs are `closed` with a merged_at)."
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['open', 'closed']
+      - name: created_at
+        description: When the PR was opened (UTC).
+        data_tests:
+          - not_null
+      - name: updated_at
+        description: Last activity on the PR (UTC).
+        data_tests:
+          - not_null
+      - name: closed_at
+        description: When the PR was closed, merged or not (UTC); NULL while open.
+      - name: merged_at
+        description: When the PR was merged (UTC); NULL unless merged.
+      - name: fetched_at
+        description: When the landing page holding this PR was fetched (UTC).
+
+  - name: stg_pr_reviews
+    description: >
+      One row per submitted review, deduplicated to the latest fetch per (repo, id).
+      PENDING (draft) reviews are dropped; they have no submitted_at. is_bot uses the
+      bot rule on the reviewer.
+    columns:
+      - name: repo
+        description: Repository as `owner/name`.
+        data_tests:
+          - not_null
+      - name: review_id
+        description: Review id (natural key).
+        data_tests:
+          - unique
+          - not_null
+      - name: pr_number
+        description: Number of the reviewed PR, parsed from the end of pull_request_url.
+        data_tests:
+          - not_null
+      - name: reviewer_login
+        description: GitHub login of the reviewer; NULL for deleted accounts.
+      - name: is_bot
+        description: True if the reviewer is a bot.
+        data_tests:
+          - not_null
+      - name: state
+        description: Review outcome.
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['APPROVED', 'CHANGES_REQUESTED', 'COMMENTED', 'DISMISSED']
+      - name: submitted_at
+        description: When the review was submitted (UTC).
+        data_tests:
+          - not_null
+      - name: fetched_at
+        description: When the landing page holding this review was fetched (UTC).
+      - name: pr_key
+        description: "`repo#pr_number`; must match a PR in stg_pull_requests."
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_pull_requests')
+                field: pr_key
+
+  - name: stg_releases
+    description: >
+      One row per published release (drafts dropped), deduplicated to the latest fetch
+      per (repo, id). Pre-releases are kept and flagged.
+    columns:
+      - name: repo
+        description: Repository as `owner/name`.
+        data_tests:
+          - not_null
+      - name: release_id
+        description: Release id (natural key).
+        data_tests:
+          - unique
+          - not_null
+      - name: tag_name
+        description: Git tag of the release.
+      - name: published_at
+        description: When the release was published (UTC).
+        data_tests:
+          - not_null
+      - name: prerelease
+        description: True for pre-releases (release candidates, betas).
+        data_tests:
+          - not_null
+      - name: fetched_at
+        description: When the landing page holding this release was fetched (UTC).
+
+  - name: run_context
+    description: >
+      One row of run-wide constants shared by the fact and mart models. Run time is
+      max(fetched_at) across the raw tables, so a rebuild without new data is stable.
+    columns:
+      - name: run_time
+        description: Newest fetched_at in any raw table (UTC). Stands in for "now".
+        data_tests:
+          - not_null
+      - name: run_month
+        description: First instant of the run's month (UTC); this month is partial.
+        data_tests:
+          - not_null
+      - name: window_start
+        description: Start of the analysis window, from the `window_start` dbt var.
+        data_tests:
+          - not_null
