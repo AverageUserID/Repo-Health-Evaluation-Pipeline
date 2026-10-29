@@ -32,6 +32,10 @@ class GitHubAPIError(Exception):
     """A non-retryable failure (404, 401, bad request, invalid query)."""
 
 
+class ExtractInterrupted(Exception):
+    """The run was interrupted (Ctrl-C); worker threads stop before their next request."""
+
+
 class GitHubClient:
     """Wraps httpx with rate-limit tracking and an API odometer.
 
@@ -59,6 +63,9 @@ class GitHubClient:
         self.local = threading.local()
         self.budgets = {name: {"remaining": None, "reset_at": None} for name in RATE_LIMIT_BUFFER}
         self.in_flight = threading.Semaphore(MAX_IN_FLIGHT)
+        # Set when the run is interrupted. Ctrl-C only reaches the main thread, so worker
+        # threads check this before every request and stop at the next page boundary.
+        self.stop = threading.Event()
 
     @property
     def thread_requests(self) -> int:
@@ -82,7 +89,8 @@ class GitHubClient:
                 TeeLogger("extract").warning(
                     f"Rate limit ({resource}): {budget['remaining']} left, sleeping {wait:.0f}s until reset"
                 )
-                time.sleep(wait)
+                if self.stop.wait(wait):  # sleeps, but wakes at once if interrupted
+                    raise ExtractInterrupted("Interrupted during rate-limit wait")
                 budget["remaining"] = None
             if budget["remaining"] is not None:
                 budget["remaining"] -= 1
@@ -113,6 +121,8 @@ class GitHubClient:
     def _send(self, resource: str, method: str, url: str, **kwargs) -> httpx.Response:
         """Send one request, sleeping through primary and secondary rate limits."""
         for _ in range(MAX_SECONDARY_WAITS):
+            if self.stop.is_set():
+                raise ExtractInterrupted(f"Interrupted before {method} {url}")
             self._reserve(resource)
             with self.in_flight:
                 resp = self.http.request(method, url, **kwargs)
@@ -130,7 +140,8 @@ class GitHubClient:
                 TeeLogger("extract").warning(
                     f"{resp.status_code} rate limited on {resp.request.url}, waiting {wait:.0f}s"
                 )
-                time.sleep(wait)
+                if self.stop.wait(wait):
+                    raise ExtractInterrupted("Interrupted during rate-limit wait")
                 continue
             return resp
         raise TransientGitHubError(f"Still rate limited after {MAX_SECONDARY_WAITS} waits: {url}")

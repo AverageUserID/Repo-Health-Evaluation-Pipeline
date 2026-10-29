@@ -372,9 +372,19 @@ def extract() -> dict:
 
     log.info(f"PRs and reviews via {API_MODE}; {len(REPOS)} repos, concurrency {CONCURRENCY}")
     t0 = time.monotonic()
+    client.stop.clear()
     with ThreadPoolTaskRunner(max_workers=CONCURRENCY) as runner:
         futures = runner.map(extract_repo, {"repo": REPOS, "watermarks": unmapped(watermarks)})
-        futures.wait()
+        try:
+            futures.wait()
+        except BaseException:
+            # Ctrl-C lands here, in the main thread: tell the workers to stop, let them
+            # finish the page they're writing, then re-raise. No _LOADED, so the next run
+            # resumes from the pages on disk.
+            client.stop.set()
+            log.warning("Interrupted: stopping repo threads after their current page")
+            futures.wait()
+            raise
 
     # Wait for every repo before failing, so healthy repos finish landing their pages.
     summary, failures = {}, []
