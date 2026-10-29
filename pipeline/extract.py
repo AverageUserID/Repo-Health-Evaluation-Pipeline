@@ -3,6 +3,7 @@
 import json
 import os
 import shutil
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -12,6 +13,7 @@ from prefect import task
 from prefect.tasks import exponential_backoff
 
 from pipeline.config import (
+    API_MODE,
     COMMIT_LOOKBACK_DAYS,
     DB_PATH,
     LOADED_MARKER,
@@ -20,7 +22,8 @@ from pipeline.config import (
     REPOS,
     WINDOW_START,
 )
-from pipeline.github import TransientGitHubError, get_client
+from pipeline.github import GraphQLTimeout, TransientGitHubError, get_client
+from pipeline.graphql import PULLS_QUERY, REVIEWS_QUERY, rest_pull, rest_review
 from pipeline.logs import TeeLogger
 
 ISO = "%Y-%m-%dT%H:%M:%SZ"
@@ -49,12 +52,22 @@ def repo_dir(repo: str) -> Path:
     return RAW_DIR / repo.replace("/", "__")
 
 
-def read_landing(path: Path) -> dict | None:
-    """Return a landed page, or None if it is missing or was cut off mid-write."""
+def read_landing(path: Path, resume_key: str = "next_url") -> dict | None:
+    """Return a landed page, or None if it is missing or was cut off mid-write.
+
+    `resume_key` is the field a resume follows (REST next_url, GraphQL next_cursor); a
+    page without it was landed by the other API mode, which can't be resumed mid-run.
+    """
     try:
-        return json.loads(path.read_text())
+        page = json.loads(path.read_text())
     except (FileNotFoundError, json.JSONDecodeError):
         return None
+    if resume_key not in page:
+        raise RuntimeError(
+            f"{path} was landed in the other API mode; finish the run with that "
+            f"PIPELINE_API or delete data/raw/ to start over"
+        )
+    return page
 
 
 def write_landing(path: Path, page: dict) -> None:
@@ -199,6 +212,102 @@ def extract_reviews(repo: str, since: str) -> dict:
     return totals
 
 
+# GraphQL page sizes to try, largest first; GitHub times out on big nested queries.
+GRAPHQL_PAGE_SIZES = (100, 50, 25)
+
+
+def _query_pulls(repo: str, cursor: str | None, log: TeeLogger) -> dict:
+    """One page of PRs with nested reviews, halving the page size on a server timeout."""
+    owner, name = repo.split("/")
+    for size in GRAPHQL_PAGE_SIZES:
+        try:
+            data = get_client().graphql(
+                PULLS_QUERY, {"owner": owner, "name": name, "size": size, "cursor": cursor}
+            )
+            return data
+        except GraphQLTimeout as exc:
+            log.warning(f"{repo} GraphQL timeout at {size} PRs per page ({exc}), retrying smaller")
+    raise TransientGitHubError(f"{repo} GraphQL timed out even at {GRAPHQL_PAGE_SIZES[-1]} PRs")
+
+
+def _all_reviews(repo: str, pr: dict) -> list[dict]:
+    """The PR's nested reviews, plus follow-up pages if it has more than 100."""
+    reviews, conn = list(pr["reviews"]["nodes"]), pr["reviews"]
+    owner, name = repo.split("/")
+    while conn["pageInfo"]["hasNextPage"]:
+        data = get_client().graphql(REVIEWS_QUERY, {
+            "owner": owner, "name": name, "number": pr["number"],
+            "cursor": conn["pageInfo"]["endCursor"],
+        })
+        conn = data["repository"]["pullRequest"]["reviews"]
+        reviews += conn["nodes"]
+    return reviews
+
+
+@task(**RETRY)
+def extract_pulls_graphql(repo: str, since: str) -> dict:
+    """PRs and their reviews in one paginated GraphQL query, newest-updated first.
+
+    Lands the same files as the REST tasks (pulls/page_N.json and
+    reviews/<number>/page_0001.json, REST field names). Each page's reviews are written
+    before the page itself, so a landed PR page means its reviews are landed too. Like
+    REST, reviews are kept for PRs created in the window and updated since `since`.
+    """
+    log, client = TeeLogger("extract"), get_client()
+    start_requests, start_points = client.requests, client.points
+    out_dir = repo_dir(repo) / "pulls"
+    stats = {"pages": 0, "fetched": 0, "records": 0, "reviews": 0, "review_prs": 0}
+    cursor, page_no = None, 1
+
+    while True:
+        file = out_dir / f"page_{page_no:04d}.json"
+        landed = read_landing(file, resume_key="next_cursor")
+        if landed is None:
+            data = _query_pulls(repo, cursor, log)
+            conn = data["repository"]["pullRequests"]
+            fetched_at = datetime.now(timezone.utc).strftime(ISO)
+            for pr in conn["nodes"]:
+                if pr["createdAt"] >= WINDOW_START and pr["updatedAt"] >= since:
+                    reviews = [rest_review(r, repo, pr["number"]) for r in _all_reviews(repo, pr)]
+                    write_landing(repo_dir(repo) / "reviews" / str(pr["number"]) / "page_0001.json", {
+                        "repo": repo, "endpoint": "reviews", "api": "graphql", "page": 1,
+                        "fetched_at": fetched_at, "next_cursor": None, "data": reviews,
+                    })
+                    stats["review_prs"] += 1
+                    stats["reviews"] += len(reviews)
+            landed = {
+                "repo": repo,
+                "endpoint": "pulls",
+                "api": "graphql",
+                "page": page_no,
+                "cursor": cursor,
+                "fetched_at": fetched_at,
+                "next_cursor": conn["pageInfo"]["endCursor"] if conn["pageInfo"]["hasNextPage"] else None,
+                "rate_limit": data["rateLimit"],
+                "data": [rest_pull(pr) for pr in conn["nodes"]],
+            }
+            write_landing(file, landed)
+            stats["fetched"] += 1
+
+        stats["pages"] += 1
+        stats["records"] += len(landed["data"])
+        if landed["data"] and landed["data"][-1]["updated_at"] < since:
+            break
+        cursor = landed["next_cursor"]
+        if not cursor:
+            break
+        page_no += 1
+
+    log.info(
+        f"{repo} pulls+reviews (graphql): {stats['records']} PRs, {stats['pages']} pages "
+        f"({stats['fetched']} fetched, {stats['pages'] - stats['fetched']} already on disk), "
+        f"{stats['reviews']} reviews for {stats['review_prs']} PRs fetched, "
+        f"{client.requests - start_requests} requests, {client.points - start_points} points, "
+        f"{client.budgets['graphql']['remaining']} points left"
+    )
+    return stats
+
+
 @task
 def extract() -> dict:
     """Task 1. Resume an interrupted run, or start fresh from the _load_state watermark."""
@@ -216,6 +325,7 @@ def extract() -> dict:
         log.info(f"No data/raw/: full extract from {WINDOW_START}")
         watermarks = {}
 
+    log.info(f"PRs and reviews via {API_MODE}")
     summary = {}
     for repo in REPOS:
         pulls_since = watermarks.get((repo, "pulls"), WINDOW_START)
@@ -225,13 +335,20 @@ def extract() -> dict:
             commits_since = max(WINDOW_START, lookback.strftime(ISO))
         log.info(f"{repo}: commits since {commits_since}, PRs updated since {pulls_since}")
 
-        summary[repo] = {
-            "commits": extract_commits(repo, commits_since),
-            "pulls": extract_pulls(repo, pulls_since),
-            "reviews": extract_reviews(repo, pulls_since),
-            "releases": extract_releases(repo),
-        }
+        summary[repo] = {"commits": extract_commits(repo, commits_since)}
+        # PRs + reviews are timed and counted on their own: the REST vs GraphQL comparison.
+        t0, r0, p0 = time.monotonic(), client.requests, client.points
+        if API_MODE == "graphql":
+            summary[repo]["pulls_reviews"] = extract_pulls_graphql(repo, pulls_since)
+        else:
+            summary[repo]["pulls"] = extract_pulls(repo, pulls_since)
+            summary[repo]["reviews"] = extract_reviews(repo, pulls_since)
+        log.info(
+            f"{repo} PRs+reviews via {API_MODE}: {client.requests - r0} requests, "
+            f"{client.points - p0} GraphQL points, {time.monotonic() - t0:.1f}s"
+        )
+        summary[repo]["releases"] = extract_releases(repo)
 
     requests = client.requests - start
-    log.info(f"Extract finished: {requests} API requests this run")
-    return {"requests": requests, "repos": summary}
+    log.info(f"Extract finished: {requests} API requests ({client.points} GraphQL points) this run")
+    return {"requests": requests, "api": API_MODE, "repos": summary}

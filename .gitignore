@@ -1,5 +1,7 @@
 storage*
 github*
+# The course ignores github* (token files); the API client module must still be committed.
+!pipeline/github.py
 CLAUDE.md
 *.duckdb
 *.duckdb.wal

@@ -13,6 +13,10 @@ PLOT_DIR = PROJECT_DIR / "plots"
 API_URL = "https://api.github.com"
 PER_PAGE = 100
 
+# PRs and reviews come from GraphQL by default; PIPELINE_API=rest uses the REST
+# endpoints instead (commits and releases always use REST). Kept for the comparison.
+API_MODE = os.environ.get("PIPELINE_API", "graphql")
+
 # Window start is fixed by the assignment; override only for faster development runs.
 WINDOW_START = os.environ.get("PIPELINE_START", "2024-01-01T00:00:00Z")
 

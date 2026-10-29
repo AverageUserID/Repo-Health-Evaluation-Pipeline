@@ -21,7 +21,10 @@ def package_health_flow() -> dict:
     model()
     plot()
 
-    TeeLogger("flow").info(f"API odometer: {get_client().requests} requests this flow run")
+    client = get_client()
+    TeeLogger("flow").info(
+        f"API odometer: {client.requests} requests ({client.points} GraphQL points) this flow run"
+    )
     return extracted
 
 
