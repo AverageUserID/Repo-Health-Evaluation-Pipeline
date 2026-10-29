@@ -15,6 +15,9 @@ from pipeline.logs import TeeLogger
 RATE_LIMIT_BUFFER = {"core": 20, "graphql": 100}
 # How many 403/429 secondary-limit waits to absorb before giving up on a request.
 MAX_SECONDARY_WAITS = 5
+# Most HTTP requests in flight at once across all threads; GitHub's secondary limits
+# penalize bursts of concurrent requests.
+MAX_IN_FLIGHT = 4
 
 
 class TransientGitHubError(Exception):
@@ -32,9 +35,10 @@ class GitHubAPIError(Exception):
 class GitHubClient:
     """Wraps httpx with rate-limit tracking and an API odometer.
 
-    REST ("core") and GraphQL have separate hourly budgets, tracked separately. The
-    lock makes the budget checks and counters safe to share across threads, so repos
-    can be fetched concurrently through this same client.
+    REST ("core") and GraphQL have separate hourly budgets, tracked separately. All
+    threads share one client, so it is the shared limiter for concurrent repo fetches:
+    each request reserves budget under the lock before it is sent, and a semaphore caps
+    how many requests are in flight at once.
     """
 
     def __init__(self, token: str):
@@ -50,36 +54,68 @@ class GitHubClient:
         self.lock = threading.Lock()
         self.requests = 0  # every HTTP call, REST or GraphQL (the odometer)
         self.points = 0  # GraphQL points spent (sum of rateLimit.cost)
+        # Per-thread counts, so each repo's logs show its own requests while repos run
+        # in parallel (one repo per worker thread).
+        self.local = threading.local()
         self.budgets = {name: {"remaining": None, "reset_at": None} for name in RATE_LIMIT_BUFFER}
+        self.in_flight = threading.Semaphore(MAX_IN_FLIGHT)
 
-    def _wait_for_budget(self, resource: str) -> None:
+    @property
+    def thread_requests(self) -> int:
+        """HTTP requests made by the calling thread."""
+        return getattr(self.local, "requests", 0)
+
+    @property
+    def thread_points(self) -> int:
+        """GraphQL points spent by the calling thread."""
+        return getattr(self.local, "points", 0)
+
+    def _reserve(self, resource: str) -> None:
+        """Wait out the budget if it is at the buffer, then reserve one unit (a request,
+        or about one GraphQL point) before sending. Reserving under the lock means
+        parallel threads can't all pass the check at the edge of the buffer. A thread
+        that sleeps holds the lock, so every thread pauses until the reset."""
         with self.lock:
             budget = self.budgets[resource]
-            if budget["remaining"] is None or budget["remaining"] > RATE_LIMIT_BUFFER[resource]:
-                return
-            wait = max(0.0, budget["reset_at"] - time.time()) + 5
-            TeeLogger("extract").warning(
-                f"Rate limit ({resource}): {budget['remaining']} left, sleeping {wait:.0f}s until reset"
-            )
-            time.sleep(wait)
-            budget["remaining"] = None
+            if budget["remaining"] is not None and budget["remaining"] <= RATE_LIMIT_BUFFER[resource]:
+                wait = max(0.0, budget["reset_at"] - time.time()) + 5
+                TeeLogger("extract").warning(
+                    f"Rate limit ({resource}): {budget['remaining']} left, sleeping {wait:.0f}s until reset"
+                )
+                time.sleep(wait)
+                budget["remaining"] = None
+            if budget["remaining"] is not None:
+                budget["remaining"] -= 1
+
+    def _update_budget(self, resource: str, remaining: int, reset_at: float) -> None:
+        """Take the server's count, unless an older response arrives after newer
+        reservations (same window, higher count): then keep the lower, reserved value.
+        Call with the lock held."""
+        budget = self.budgets[resource]
+        same_window = budget["reset_at"] is not None and reset_at <= budget["reset_at"]
+        if same_window and budget["remaining"] is not None:
+            remaining = min(remaining, budget["remaining"])
+        self.budgets[resource] = {"remaining": remaining, "reset_at": reset_at}
 
     def _track(self, resp: httpx.Response) -> None:
+        self.local.requests = self.thread_requests + 1
         with self.lock:
             self.requests += 1
             if "X-RateLimit-Remaining" in resp.headers:
                 resource = resp.headers.get("X-RateLimit-Resource", "core")
                 if resource in self.budgets:
-                    self.budgets[resource] = {
-                        "remaining": int(resp.headers["X-RateLimit-Remaining"]),
-                        "reset_at": float(resp.headers["X-RateLimit-Reset"]),
-                    }
+                    self._update_budget(
+                        resource,
+                        int(resp.headers["X-RateLimit-Remaining"]),
+                        float(resp.headers["X-RateLimit-Reset"]),
+                    )
 
     def _send(self, resource: str, method: str, url: str, **kwargs) -> httpx.Response:
         """Send one request, sleeping through primary and secondary rate limits."""
         for _ in range(MAX_SECONDARY_WAITS):
-            self._wait_for_budget(resource)
-            resp = self.http.request(method, url, **kwargs)
+            self._reserve(resource)
+            with self.in_flight:
+                resp = self.http.request(method, url, **kwargs)
             self._track(resp)
 
             if resp.status_code in (403, 429):
@@ -130,12 +166,14 @@ class GitHubClient:
 
             rate = (body.get("data") or {}).get("rateLimit")
             if rate:
+                self.local.points = self.thread_points + rate["cost"]
                 with self.lock:
                     self.points += rate["cost"]
-                    self.budgets["graphql"] = {
-                        "remaining": rate["remaining"],
-                        "reset_at": datetime.fromisoformat(rate["resetAt"].replace("Z", "+00:00")).timestamp(),
-                    }
+                    self._update_budget(
+                        "graphql",
+                        rate["remaining"],
+                        datetime.fromisoformat(rate["resetAt"].replace("Z", "+00:00")).timestamp(),
+                    )
 
             errors = body.get("errors")
             if not errors:
@@ -145,7 +183,7 @@ class GitHubClient:
                     self.budgets["graphql"]["remaining"] = 0
                     if self.budgets["graphql"]["reset_at"] is None:
                         self.budgets["graphql"]["reset_at"] = time.time() + 60
-                continue  # _wait_for_budget sleeps until the reset
+                continue  # _reserve sleeps until the reset
             if any("timeout" in e.get("message", "").lower() for e in errors):
                 raise GraphQLTimeout(errors[0]["message"])
             raise GitHubAPIError(f"GraphQL errors: {errors[:3]}")

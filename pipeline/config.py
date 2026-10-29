@@ -28,6 +28,9 @@ REPOS = [
     if r.strip()
 ]
 
+# Repos fetched in parallel (one worker thread each). 1 runs them one after another.
+CONCURRENCY = max(1, min(len(REPOS), int(os.environ.get("PIPELINE_CONCURRENCY", len(REPOS)))))
+
 # Commits can be dated before they land on the default branch (rebases, long-lived PRs),
 # so incremental runs look back this far past the watermark. Task 2 upserts the overlap.
 COMMIT_LOOKBACK_DAYS = 7

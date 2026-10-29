@@ -3,18 +3,21 @@
 import json
 import os
 import shutil
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import duckdb
 import httpx
-from prefect import task
+from prefect import task, unmapped
+from prefect.task_runners import ThreadPoolTaskRunner
 from prefect.tasks import exponential_backoff
 
 from pipeline.config import (
     API_MODE,
     COMMIT_LOOKBACK_DAYS,
+    CONCURRENCY,
     DB_PATH,
     LOADED_MARKER,
     PER_PAGE,
@@ -144,11 +147,11 @@ def _log_stats(log: TeeLogger, repo: str, endpoint: str, stats: dict, requests: 
 @task(**RETRY)
 def extract_commits(repo: str, since: str) -> dict:
     log, client = TeeLogger("extract"), get_client()
-    start = client.requests
+    start = client.thread_requests
     stats = paginate(
         repo, "commits", f"/repos/{repo}/commits", {"since": since}, repo_dir(repo) / "commits"
     )
-    _log_stats(log, repo, "commits", stats, client.requests - start)
+    _log_stats(log, repo, "commits", stats, client.thread_requests - start)
     return stats
 
 
@@ -156,7 +159,7 @@ def extract_commits(repo: str, since: str) -> dict:
 def extract_pulls(repo: str, since: str) -> dict:
     """PRs have no date filter: newest-updated first, stop once a page passes `since`."""
     log, client = TeeLogger("extract"), get_client()
-    start = client.requests
+    start = client.thread_requests
     stats = paginate(
         repo,
         "pulls",
@@ -165,16 +168,16 @@ def extract_pulls(repo: str, since: str) -> dict:
         repo_dir(repo) / "pulls",
         stop=lambda records: records[-1]["updated_at"] < since,
     )
-    _log_stats(log, repo, "pulls", stats, client.requests - start)
+    _log_stats(log, repo, "pulls", stats, client.thread_requests - start)
     return stats
 
 
 @task(**RETRY)
 def extract_releases(repo: str) -> dict:
     log, client = TeeLogger("extract"), get_client()
-    start = client.requests
+    start = client.thread_requests
     stats = paginate(repo, "releases", f"/repos/{repo}/releases", {}, repo_dir(repo) / "releases")
-    _log_stats(log, repo, "releases", stats, client.requests - start)
+    _log_stats(log, repo, "releases", stats, client.thread_requests - start)
     return stats
 
 
@@ -192,7 +195,7 @@ def prs_needing_reviews(repo: str, since: str) -> list[int]:
 def extract_reviews(repo: str, since: str) -> dict:
     """One paginated call per PR, landed under reviews/<number>/page_0001.json."""
     log, client = TeeLogger("extract"), get_client()
-    start = client.requests
+    start = client.thread_requests
     numbers = prs_needing_reviews(repo, since)
     log.info(f"{repo} reviews: {len(numbers)} PRs need review pages")
 
@@ -208,7 +211,7 @@ def extract_reviews(repo: str, since: str) -> dict:
         totals = {k: totals[k] + stats[k] for k in totals}
         if i % 500 == 0:
             log.info(f"{repo} reviews: {i}/{len(numbers)} PRs done")
-    _log_stats(log, repo, "reviews", totals, client.requests - start)
+    _log_stats(log, repo, "reviews", totals, client.thread_requests - start)
     return totals
 
 
@@ -254,7 +257,7 @@ def extract_pulls_graphql(repo: str, since: str) -> dict:
     REST, reviews are kept for PRs created in the window and updated since `since`.
     """
     log, client = TeeLogger("extract"), get_client()
-    start_requests, start_points = client.requests, client.points
+    start_requests, start_points = client.thread_requests, client.thread_points
     out_dir = repo_dir(repo) / "pulls"
     stats = {"pages": 0, "fetched": 0, "records": 0, "reviews": 0, "review_prs": 0}
     cursor, page_no = None, 1
@@ -302,15 +305,57 @@ def extract_pulls_graphql(repo: str, since: str) -> dict:
         f"{repo} pulls+reviews (graphql): {stats['records']} PRs, {stats['pages']} pages "
         f"({stats['fetched']} fetched, {stats['pages'] - stats['fetched']} already on disk), "
         f"{stats['reviews']} reviews for {stats['review_prs']} PRs fetched, "
-        f"{client.requests - start_requests} requests, {client.points - start_points} points, "
+        f"{client.thread_requests - start_requests} requests, "
+        f"{client.thread_points - start_points} points, "
         f"{client.budgets['graphql']['remaining']} points left"
     )
     return stats
 
 
+class ExtractError(Exception):
+    """One or more repos failed to extract; their landed pages are kept for a resume."""
+
+
+@task
+def extract_repo(repo: str, watermarks: dict[tuple[str, str], str]) -> dict:
+    """Every endpoint for one repo, in order. Repos run in parallel, one per worker
+    thread, all sharing the one rate-limited client."""
+    log, client = TeeLogger("extract"), get_client()
+    t_start, worker = time.monotonic(), threading.current_thread().name
+    r_start = client.thread_requests
+    pulls_since = watermarks.get((repo, "pulls"), WINDOW_START)
+    commits_since = watermarks.get((repo, "commits"), WINDOW_START)
+    if commits_since != WINDOW_START:
+        lookback = datetime.strptime(commits_since, ISO) - timedelta(days=COMMIT_LOOKBACK_DAYS)
+        commits_since = max(WINDOW_START, lookback.strftime(ISO))
+    log.info(f"{repo} started on {worker}: commits since {commits_since}, "
+             f"PRs updated since {pulls_since}")
+
+    summary = {"commits": extract_commits(repo, commits_since)}
+    # PRs + reviews are timed and counted on their own: the REST vs GraphQL comparison.
+    t0, r0, p0 = time.monotonic(), client.thread_requests, client.thread_points
+    if API_MODE == "graphql":
+        summary["pulls_reviews"] = extract_pulls_graphql(repo, pulls_since)
+    else:
+        summary["pulls"] = extract_pulls(repo, pulls_since)
+        summary["reviews"] = extract_reviews(repo, pulls_since)
+    log.info(
+        f"{repo} PRs+reviews via {API_MODE}: {client.thread_requests - r0} requests, "
+        f"{client.thread_points - p0} GraphQL points, {time.monotonic() - t0:.1f}s"
+    )
+    summary["releases"] = extract_releases(repo)
+
+    summary["seconds"] = round(time.monotonic() - t_start, 1)
+    summary["requests"] = client.thread_requests - r_start
+    log.info(f"{repo} finished in {summary['seconds']}s on {worker}, "
+             f"{summary['requests']} requests")
+    return summary
+
+
 @task
 def extract() -> dict:
-    """Task 1. Resume an interrupted run, or start fresh from the _load_state watermark."""
+    """Task 1. Resume an interrupted run, or start fresh from the _load_state watermark,
+    then fetch the repos in parallel (PIPELINE_CONCURRENCY at a time)."""
     log, client = TeeLogger("extract"), get_client()
     start = client.requests
 
@@ -325,30 +370,30 @@ def extract() -> dict:
         log.info(f"No data/raw/: full extract from {WINDOW_START}")
         watermarks = {}
 
-    log.info(f"PRs and reviews via {API_MODE}")
-    summary = {}
-    for repo in REPOS:
-        pulls_since = watermarks.get((repo, "pulls"), WINDOW_START)
-        commits_since = watermarks.get((repo, "commits"), WINDOW_START)
-        if commits_since != WINDOW_START:
-            lookback = datetime.strptime(commits_since, ISO) - timedelta(days=COMMIT_LOOKBACK_DAYS)
-            commits_since = max(WINDOW_START, lookback.strftime(ISO))
-        log.info(f"{repo}: commits since {commits_since}, PRs updated since {pulls_since}")
+    log.info(f"PRs and reviews via {API_MODE}; {len(REPOS)} repos, concurrency {CONCURRENCY}")
+    t0 = time.monotonic()
+    with ThreadPoolTaskRunner(max_workers=CONCURRENCY) as runner:
+        futures = runner.map(extract_repo, {"repo": REPOS, "watermarks": unmapped(watermarks)})
+        futures.wait()
 
-        summary[repo] = {"commits": extract_commits(repo, commits_since)}
-        # PRs + reviews are timed and counted on their own: the REST vs GraphQL comparison.
-        t0, r0, p0 = time.monotonic(), client.requests, client.points
-        if API_MODE == "graphql":
-            summary[repo]["pulls_reviews"] = extract_pulls_graphql(repo, pulls_since)
-        else:
-            summary[repo]["pulls"] = extract_pulls(repo, pulls_since)
-            summary[repo]["reviews"] = extract_reviews(repo, pulls_since)
-        log.info(
-            f"{repo} PRs+reviews via {API_MODE}: {client.requests - r0} requests, "
-            f"{client.points - p0} GraphQL points, {time.monotonic() - t0:.1f}s"
-        )
-        summary[repo]["releases"] = extract_releases(repo)
+    # Wait for every repo before failing, so healthy repos finish landing their pages.
+    summary, failures = {}, []
+    for repo, future in zip(REPOS, futures):
+        try:
+            summary[repo] = future.result()
+        except Exception as exc:
+            log.error(f"{repo} failed: {type(exc).__name__}: {exc}")
+            failures.append(f"{repo}: {exc}")
+    if failures:
+        raise ExtractError(f"{len(failures)} repo(s) failed; rerun to resume: " + " | ".join(failures))
 
+    wall = time.monotonic() - t0
+    summed = sum(r["seconds"] for r in summary.values())
     requests = client.requests - start
-    log.info(f"Extract finished: {requests} API requests ({client.points} GraphQL points) this run")
-    return {"requests": requests, "api": API_MODE, "repos": summary}
+    log.info(
+        f"Extract finished: {requests} API requests ({client.points} GraphQL points); "
+        f"concurrency {CONCURRENCY}, wall {wall:.1f}s, sum of repo times {summed:.1f}s "
+        f"({summed / wall:.2f}x)"
+    )
+    return {"requests": requests, "api": API_MODE, "concurrency": CONCURRENCY,
+            "seconds": round(wall, 1), "repos": summary}
