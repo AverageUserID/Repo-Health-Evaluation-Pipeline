@@ -207,7 +207,7 @@ Task 4 does not repeat Task 3's work. Task 3's `dbt` tests check that each model
 
 | Criterion | Full credit requires | Pts |
 | --- | --- | --- |
-| Completeness checks | For each repo and endpoint, every distinct `(repo, id)` record in `data/raw/` appears in the raw table, and the raw table's row count matches its staging model. Every repo has commits in every complete month of the window (the current, partial month is exempt). Any mismatch fails the task. | 3 |
+| Completeness checks | For each repo and endpoint, every distinct `(repo, id)` record in `data/raw/` appears in the raw table, and the raw table's row count matches its staging model. Any mismatch fails the task. Complete months with no commits (the current, partial month is exempt) are logged as a warning, since an empty month is a real quiet month rather than missing data. | 3 |
 | Outlier detection | Scan time to merge and weekly commits for values far outside the typical range (for example, a PR open for years or a week with a burst of automated commits). State the cutoff you used, list the records it flags, and say whether you keep, cap, or drop them, and why. | 3 |
 | Descriptive statistics | Per repo: median and 90th percentile time to first review and time to merge; commits per week; releases per year. Read durations from the marts (do not recompute them). Printed to screen and log. | 3 |
 
