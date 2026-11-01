@@ -113,7 +113,9 @@ def plot_trends(monthly: pd.DataFrame, ranked: pd.DataFrame) -> plt.Figure:
         ax.set_title(title)
         ax.set_ylabel(unit)
         ax.set_ylim(bottom=0)
-        ax.xaxis.set_major_locator(mdates.MonthLocator(interval=max(1, monthly["month"].nunique() // 8)))
+        # Quarterly ticks over a long window, monthly over a short one.
+        months = None if monthly["month"].nunique() <= 8 else (1, 4, 7, 10)
+        ax.xaxis.set_major_locator(mdates.MonthLocator(bymonth=months))
         ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
         ax.tick_params(axis="x", rotation=45)
     # Direct labels at the end of each line in the first panel.
@@ -145,6 +147,8 @@ def plot_relationship(monthly: pd.DataFrame, overall: pd.DataFrame,
 
     fig, ax = plt.subplots(figsize=(10, 6.5))
     points = monthly.dropna(subset=["median_first_review_hours", "merge_ratio"])
+    # Label slots top to bottom in the same order as the markers, so leader lines don't cross.
+    slot = {repo: i for i, repo in enumerate(overall.sort_values("merge_rate", ascending=False)["repo"])}
     for r in ranked.itertuples():
         g = points[points["repo"] == r.repo]
         ax.scatter(g["median_first_review_hours"], g["merge_ratio"],
@@ -155,14 +159,13 @@ def plot_relationship(monthly: pd.DataFrame, overall: pd.DataFrame,
             ax.scatter(o["median_hours_to_first_review"], o["merge_rate"],
                        s=size(o["active_authors_per_month"]), color=COLORS[r.repo],
                        edgecolor=INK, linewidth=2, zorder=3)
-            # Clear the marker; alternate above/below by rank so nearby labels don't collide.
-            offset = size(o["active_authors_per_month"]) ** 0.5 / 2 + 4
-            above = r.rank % 2 == 1
+            # Whole-window markers sit inside the monthly cloud, so their labels are
+            # stacked in clear space with a thin leader line to the marker.
             ax.annotate(f"{short(r.repo)} (window)",
                         (o["median_hours_to_first_review"], o["merge_rate"]),
-                        xytext=(offset, offset if above else -offset), textcoords="offset points",
-                        va="bottom" if above else "top", color=INK, fontsize=9,
-                        fontweight="bold")
+                        xytext=(0.30, 0.55 - 0.07 * slot[r.repo]), textcoords="axes fraction",
+                        va="center", color=INK, fontsize=9, fontweight="bold",
+                        arrowprops={"arrowstyle": "-", "color": MUTED, "linewidth": 0.8})
     ax.set_xlabel("Median time to first review (hours)")
     ax.set_ylabel("Merge ratio (merged / closed, 0-1)")
     ax.set_xlim(left=0)
