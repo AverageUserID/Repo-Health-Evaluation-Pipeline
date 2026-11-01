@@ -205,13 +205,14 @@ _client: GitHubClient | None = None
 
 
 def get_client() -> GitHubClient:
-    """Return the process-wide client, created on first use from GH_PAT."""
+    """Return the process-wide client, created on first use from GH_PAT, or from the
+    Secret block vra7dy-pat where GH_PAT is unset (deployment runs on the server)."""
     global _client
     if _client is None:
         token = os.environ.get("GH_PAT")
         if not token:
             from prefect.blocks.system import Secret
 
-            token = Secret.load(os.environ.get("GH_PAT_BLOCK", "gh-pat")).get()
+            token = Secret.load(os.environ.get("GH_PAT_BLOCK", "vra7dy-pat")).get()
         _client = GitHubClient(token)
     return _client
