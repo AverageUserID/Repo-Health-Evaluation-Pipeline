@@ -1,6 +1,6 @@
 # Submission Checklist
 
-Due: Nov 02, 2026. Full grading criteria are in the course template's README (this repo's first commit, `e6a8a41`); [README.md](README.md) now holds the project write-up.
+Due: Nov 04, 2026. [README.md](README.md) modified to hold the project write-up.
 
 ## Submit in Canvas
 
