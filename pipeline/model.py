@@ -25,8 +25,9 @@ METRICS = {
     "bus_factor": ("contributors", +1, "worst"),
 }
 
-# Dimension weights, ordered by ASSESSING-HEALTH.md: responsiveness first, bus factor and
-# contributor diversity second, backlog and acceptance next, raw activity last.
+# Dimension weights, by how directly each shows whether maintainers keep up (README):
+# responsiveness first, contributor base and backlog next, then acceptance; the noisier
+# single-slope or single-ratio signals (release regularity, commit trend) last.
 WEIGHTS = {
     "responsiveness": 0.25,
     "contributors": 0.20,
